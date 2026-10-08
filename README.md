@@ -55,3 +55,9 @@ Open [http://localhost:1420](http://localhost:1420) in your browser.
 npm run tauri dev
 ```
 *Note: Compiling the native Windows desktop binary with Rust requires Microsoft Visual C++ Build Tools (`link.exe`).*
+
+## Publish as a Web App
+
+The repository includes a Render Blueprint. To publish it, connect the GitHub repository to Render and create a Blueprint instance from `render.yaml`. Render builds the Vite frontend and starts the Node web server, which serves the app and its API routes from the same origin. Subsequent pushes to `main` deploy automatically.
+
+The hosted app keeps Jira credentials, the GitHub Copilot token, drafts, and context in the current browser's local storage; they do not sync between browsers or devices. The production Jira proxy only accepts HTTPS Jira Cloud API v3 requests on `*.atlassian.net`; custom Jira domains are not currently supported. Render's free service may sleep when idle and take a little longer to respond on the first visit.

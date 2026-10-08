@@ -5,8 +5,9 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "tsc && tsc --project tsconfig.server.json && vite build",
     "preview": "vite preview",
+    "start": "tsx server/index.ts",
     "tauri": "tauri"
   },
   "dependencies": {
@@ -18,7 +19,8 @@
     "mammoth": "^1.13.0",
     "pdfjs-dist": "^6.4.299",
     "react": "^19.1.0",
-    "react-dom": "^19.1.0"
+    "react-dom": "^19.1.0",
+    "tsx": "^4.23.15"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
