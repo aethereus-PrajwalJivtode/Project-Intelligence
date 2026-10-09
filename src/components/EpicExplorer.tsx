@@ -28,6 +28,7 @@ const renderJiraContent = (content: string): React.ReactNode => {
     if (node.nodeType === Node.TEXT_NODE) return node.textContent;
     if (!(node instanceof Element)) return null;
     if (['SCRIPT', 'STYLE', 'IFRAME', 'OBJECT'].includes(node.tagName)) return null;
+    if (node.tagName === 'BR') return <br key={key} />;
 
     const children = Array.from(node.childNodes).map((child, index) => renderNode(child, `${key}-${index}`));
     if (node.tagName === 'A') {
