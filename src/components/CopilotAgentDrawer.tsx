@@ -27,6 +27,7 @@ import {
   CopilotChatMessage,
   CopilotConversationTurn,
   CopilotChatSession,
+  ChatHistorySyncState,
 } from '../services/copilotService';
 import { extractDocument, ExtractedDocument } from '../services/documentIngestion';
 
@@ -84,20 +85,54 @@ export const CopilotAgentDrawer: React.FC<CopilotAgentDrawerProps> = ({
   const [isExtractingFiles, setIsExtractingFiles] = useState(false);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [analysisToView, setAnalysisToView] = useState<RequirementAnalysisResult | null>(null);
+  const [historySyncState, setHistorySyncState] = useState<ChatHistorySyncState>('local');
+  const [historySyncMessage, setHistorySyncMessage] = useState('');
+  const [historySyncLoading, setHistorySyncLoading] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const inputTextareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Load sessions from storage when component mounts or opens
+  useEffect(() => copilotService.subscribeChatHistorySync((state, message) => {
+    setHistorySyncState(state);
+    setHistorySyncMessage(message || '');
+  }), []);
+
+  // Load local history immediately, then merge it with the Jira account's server history.
   useEffect(() => {
-    if (isOpen) {
-      const allSessions = copilotService.getSessions();
-      setSessions(allSessions);
-      const active = copilotService.getOrCreateActiveSession(currentProject?.jira_project_key || 'ISB');
+    if (!isOpen) return;
+
+    let isCurrent = true;
+    const localSessions = copilotService.getSessions();
+    const activeId = copilotService.getActiveSessionId();
+    const localActive = localSessions.find((session) => session.id === activeId) || localSessions[0] || null;
+    setSessions(localSessions);
+    setActiveSession(localActive);
+    setMessages(localActive?.messages || []);
+    setTokenInput(copilotService.getGithubToken() || authStatus.copilot_token || '');
+    setHistorySyncLoading(true);
+
+    copilotService.syncSessionsWithServer(localSessions).then((syncedSessions) => {
+      if (!isCurrent) return;
+      setSessions(syncedSessions);
+      const active = syncedSessions.find((session) => session.id === localActive?.id)
+        || syncedSessions[0]
+        || copilotService.getOrCreateActiveSession(currentProject?.jira_project_key || 'ISB');
+      copilotService.setActiveSessionId(active.id);
       setActiveSession(active);
       setMessages(active.messages);
-      setTokenInput(copilotService.getGithubToken() || authStatus.copilot_token || '');
-    }
+    }).catch(() => {
+      if (!isCurrent) return;
+      const fallback = localActive || copilotService.getOrCreateActiveSession(currentProject?.jira_project_key || 'ISB');
+      setSessions(copilotService.getSessions());
+      setActiveSession(fallback);
+      setMessages(fallback.messages);
+    }).finally(() => {
+      if (isCurrent) setHistorySyncLoading(false);
+    });
+
+    return () => {
+      isCurrent = false;
+    };
   }, [isOpen, currentProject?.jira_project_key, authStatus.copilot_token]);
 
   // Sync token from authStatus if changed
@@ -597,6 +632,16 @@ export const CopilotAgentDrawer: React.FC<CopilotAgentDrawerProps> = ({
               Space: <strong>{currentProject?.jira_project_key || 'ISB'}</strong> •{' '}
               {activeSession ? activeSession.title : 'Active Session'}
             </span>
+            <span
+              role="status"
+              title={historySyncMessage || undefined}
+              style={{ fontSize: '10px', color: historySyncState === 'unavailable' ? '#d29922' : 'var(--text-muted)' }}
+            >
+              {historySyncState === 'syncing' ? 'Syncing chat history…'
+                : historySyncState === 'synced' ? 'History synced across browsers'
+                  : historySyncState === 'unavailable' ? 'History sync unavailable'
+                    : 'Local history only'}
+            </span>
           </div>
         </div>
 
@@ -607,6 +652,7 @@ export const CopilotAgentDrawer: React.FC<CopilotAgentDrawerProps> = ({
             title="Start New Chat Session"
             aria-label="Start new chat"
             className="btn btn-secondary"
+            disabled={historySyncLoading}
             style={{ padding: '6px', lineHeight: 0 }}
           >
             <Plus size={13} />
@@ -618,6 +664,7 @@ export const CopilotAgentDrawer: React.FC<CopilotAgentDrawerProps> = ({
             title="View Past Chat Sessions"
             aria-label="Chat history"
             className="btn btn-secondary"
+            disabled={historySyncLoading}
             style={{
               padding: '6px',
               lineHeight: 0,
@@ -1196,7 +1243,7 @@ export const CopilotAgentDrawer: React.FC<CopilotAgentDrawerProps> = ({
             aria-label="Attach TXT, DOCX, or PDF files"
             style={{ display: 'none' }}
           />
-          <button type="button" className="btn btn-secondary" title="Attach TXT, DOCX, or PDF files" aria-label="Attach files" onClick={() => fileInputRef.current?.click()} disabled={isProcessing || isExtractingFiles} style={{ padding: '8px', lineHeight: 0, flexShrink: 0 }}>
+          <button type="button" className="btn btn-secondary" title="Attach TXT, DOCX, or PDF files" aria-label="Attach files" onClick={() => fileInputRef.current?.click()} disabled={historySyncLoading || isProcessing || isExtractingFiles} style={{ padding: '8px', lineHeight: 0, flexShrink: 0 }}>
             <Paperclip size={15} />
           </button>
           {modelStatus === 'ready' && availableModels.length > 0 && (
@@ -1225,14 +1272,14 @@ export const CopilotAgentDrawer: React.FC<CopilotAgentDrawerProps> = ({
                 handleSend();
               }
             }}
-            disabled={modelStatus !== 'ready' || isProcessing}
+            disabled={historySyncLoading || modelStatus !== 'ready' || isProcessing}
             style={{ flex: 1, minWidth: 0, height: '38px', minHeight: '38px', maxHeight: '160px', resize: 'none', background: 'var(--bg-input)', border: '1px solid var(--border-subtle)', borderRadius: '6px', padding: '9px 11px', color: 'var(--text-primary)', fontSize: '13px', fontFamily: 'inherit', lineHeight: 1.4, overflowY: inputVal.length > 0 ? 'auto' : 'hidden', outline: 'none' }}
           />
           <button
             className="btn btn-primary"
             style={{ padding: '8px 10px', lineHeight: 0, flexShrink: 0 }}
             onClick={handleSend}
-            disabled={(!inputVal.trim() && workspaceAttachments.length === 0) || isProcessing || isExtractingFiles || modelStatus !== 'ready'}
+            disabled={historySyncLoading || (!inputVal.trim() && workspaceAttachments.length === 0) || isProcessing || isExtractingFiles || modelStatus !== 'ready'}
             title="Send to Copilot"
             aria-label="Send to Copilot"
           >

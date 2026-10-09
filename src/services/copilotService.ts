@@ -12,6 +12,7 @@ import {
   TicketDraft,
 } from '../types';
 import { getUserStorageItem, removeUserStorageItem, setUserStorageItem } from './userStorage';
+import { jiraService } from './jiraService';
 
 export interface CopilotEpicContextAnalysis {
   summary: string;
@@ -57,14 +58,143 @@ export interface CopilotChatSession {
   messages: CopilotChatMessage[];
 }
 
+export type ChatHistorySyncState = 'local' | 'syncing' | 'synced' | 'unavailable';
+
+type ChatHistorySyncListener = (state: ChatHistorySyncState, message?: string) => void;
+
 const STORAGE_KEYS = {
   SESSIONS: 'copilot_chat_sessions_v2',
   ACTIVE_SESSION_ID: 'copilot_active_session_id_v2',
   GITHUB_TOKEN: 'copilot_github_token_v2',
   COPILOT_ENDPOINT: 'copilot_custom_endpoint_v2',
+  DELETED_SESSIONS: 'copilot_deleted_sessions_v1',
 };
 
 class CopilotService {
+  private historySyncListeners = new Set<ChatHistorySyncListener>();
+  private historyWriteQueue: Promise<void> = Promise.resolve();
+
+  public subscribeChatHistorySync(listener: ChatHistorySyncListener): () => void {
+    this.historySyncListeners.add(listener);
+    return () => this.historySyncListeners.delete(listener);
+  }
+
+  private emitChatHistorySync(state: ChatHistorySyncState, message?: string): void {
+    for (const listener of this.historySyncListeners) listener(state, message);
+  }
+
+  private isWebApp(): boolean {
+    return typeof window !== 'undefined'
+      && !(window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
+  }
+
+  private getDeletedSessions(): Record<string, string> {
+    try {
+      return JSON.parse(getUserStorageItem(STORAGE_KEYS.DELETED_SESSIONS) || '{}') as Record<string, string>;
+    } catch {
+      return {};
+    }
+  }
+
+  private saveDeletedSessions(deleted: Record<string, string>): void {
+    setUserStorageItem(STORAGE_KEYS.DELETED_SESSIONS, JSON.stringify(deleted));
+  }
+
+  private async enqueueHistoryWrite(write: () => Promise<void>): Promise<void> {
+    const nextWrite = this.historyWriteQueue.catch(() => undefined).then(write);
+    this.historyWriteQueue = nextWrite;
+    return nextWrite;
+  }
+
+  private async sendHistoryRequest(path: string, init: RequestInit = {}): Promise<Response> {
+    const authHeaders = jiraService.getChatHistoryAuthHeaders();
+    if (!authHeaders || !this.isWebApp()) throw new Error('Jira account is not available for chat history sync.');
+    const headers = new Headers(authHeaders);
+    new Headers(init.headers).forEach((value, key) => headers.set(key, value));
+    const response = await fetch(path, { ...init, headers });
+    if (!response.ok) {
+      let message = `Chat history sync failed (${response.status}).`;
+      try {
+        const body = await response.json() as { error?: string };
+        if (body.error) message = body.error;
+      } catch {
+        // Keep the status-based message when the response is not JSON.
+      }
+      throw new Error(message);
+    }
+    return response;
+  }
+
+  private persistSessionsToServer(sessions: CopilotChatSession[]): Promise<void> {
+    return this.enqueueHistoryWrite(async () => {
+      this.emitChatHistorySync('syncing');
+      await this.sendHistoryRequest('/api/chat-sessions', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessions }),
+      });
+      this.emitChatHistorySync('synced');
+    }).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : 'Chat history could not be synced.';
+      this.emitChatHistorySync('unavailable', message);
+      throw error;
+    });
+  }
+
+  public async syncSessionsWithServer(localSessions: CopilotChatSession[]): Promise<CopilotChatSession[]> {
+    if (!this.isWebApp() || !jiraService.getChatHistoryAuthHeaders()) {
+      this.emitChatHistorySync('local', 'Chat history is stored only in this browser.');
+      return localSessions;
+    }
+
+    this.emitChatHistorySync('syncing');
+    try {
+      const response = await this.sendHistoryRequest('/api/chat-sessions');
+      const remote = await response.json() as {
+        sessions: CopilotChatSession[];
+        deleted: Array<{ id: string; deletedAt: string }>;
+      };
+      const tombstones = this.getDeletedSessions();
+      const remoteDeleted = new Set<string>();
+      for (const entry of remote.deleted || []) {
+        remoteDeleted.add(entry.id);
+        if (!tombstones[entry.id] || Date.parse(entry.deletedAt) > Date.parse(tombstones[entry.id])) {
+          tombstones[entry.id] = entry.deletedAt;
+        }
+      }
+
+      const sessionsById = new Map<string, CopilotChatSession>();
+      for (const session of [...localSessions, ...(remote.sessions || [])]) {
+        const current = sessionsById.get(session.id);
+        if (!current || Date.parse(session.updated_at) >= Date.parse(current.updated_at)) {
+          sessionsById.set(session.id, session);
+        }
+      }
+      const merged = [...sessionsById.values()].filter((session) => !tombstones[session.id]);
+      this.saveDeletedSessions(tombstones);
+      for (const [sessionId, deletedAt] of Object.entries(tombstones)) {
+        if (!remoteDeleted.has(sessionId)) await this.deleteSessionFromServer(sessionId, deletedAt);
+      }
+      await this.persistSessionsToServer(merged);
+      this.saveSessionsLocally(merged);
+      this.emitChatHistorySync('synced');
+      return merged;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Chat history could not be synced.';
+      this.emitChatHistorySync('unavailable', message);
+      throw error;
+    }
+  }
+
+  private deleteSessionFromServer(sessionId: string, deletedAt: string): Promise<void> {
+    return this.enqueueHistoryWrite(async () => {
+      await this.sendHistoryRequest(`/api/chat-sessions/${encodeURIComponent(sessionId)}`, {
+        method: 'DELETE',
+        headers: { 'X-Deleted-At': deletedAt },
+      });
+    });
+  }
+
   public getGithubToken(): string {
     return getUserStorageItem(STORAGE_KEYS.GITHUB_TOKEN) || '';
   }
@@ -92,7 +222,7 @@ class CopilotService {
   // --- Session Management ---
 
   public getSessions(): CopilotChatSession[] {
-    if (typeof window === 'undefined' || !this.getGithubToken() && !getUserStorageItem(STORAGE_KEYS.SESSIONS)) return [];
+    if (typeof window === 'undefined') return [];
     try {
       const data = getUserStorageItem(STORAGE_KEYS.SESSIONS);
       if (data) {
@@ -106,6 +236,13 @@ class CopilotService {
 
   public saveSessions(sessions: CopilotChatSession[]): void {
     if (typeof window === 'undefined') return;
+    this.saveSessionsLocally(sessions);
+    if (this.isWebApp() && jiraService.getChatHistoryAuthHeaders()) {
+      void this.persistSessionsToServer(sessions).catch(() => undefined);
+    }
+  }
+
+  private saveSessionsLocally(sessions: CopilotChatSession[]): void {
     try {
       setUserStorageItem(STORAGE_KEYS.SESSIONS, JSON.stringify(sessions));
     } catch (e) {
@@ -188,6 +325,16 @@ class CopilotService {
   public deleteSession(sessionId: string): CopilotChatSession[] {
     const sessions = this.getSessions();
     const filtered = sessions.filter((s) => s.id !== sessionId);
+    const deleted = this.getDeletedSessions();
+    const deletedAt = new Date().toISOString();
+    deleted[sessionId] = deletedAt;
+    this.saveDeletedSessions(deleted);
+    if (this.isWebApp() && jiraService.getChatHistoryAuthHeaders()) {
+      void this.deleteSessionFromServer(sessionId, deletedAt).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : 'Chat history deletion could not be synced.';
+        this.emitChatHistorySync('unavailable', message);
+      });
+    }
     this.saveSessions(filtered);
     if (this.getActiveSessionId() === sessionId) {
       if (filtered.length > 0) {

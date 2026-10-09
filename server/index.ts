@@ -2,6 +2,7 @@ import { createReadStream, promises as fs } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import https from 'node:https';
 import { extname, resolve, sep } from 'node:path';
+import { Pool } from 'pg';
 import {
   buildEpicContextViaCopilotSdk,
   executeCopilotViaNode,
@@ -12,6 +13,10 @@ import {
 
 const distDirectory = resolve(process.cwd(), 'dist');
 const maxBodyBytes = 12 * 1024 * 1024;
+const chatHistoryPool = process.env.DATABASE_URL
+  ? new Pool({ connectionString: process.env.DATABASE_URL })
+  : null;
+let chatHistorySchemaReady: Promise<void> | null = null;
 
 class HttpError extends Error {
   constructor(readonly statusCode: number, message: string) {
@@ -61,6 +66,153 @@ function validJiraTarget(target: URL): boolean {
     && labels.slice(-2).join('.') === 'atlassian.net'
     && labels.slice(0, -2).every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label))
     && /^\/rest\/api\/3\//.test(target.pathname);
+}
+
+function validJiraDomain(domain: string): boolean {
+  const labels = domain.toLowerCase().split('.');
+  return labels.length >= 3
+    && labels.slice(-2).join('.') === 'atlassian.net'
+    && labels.every((label) => /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label));
+}
+
+async function ensureChatHistorySchema(): Promise<void> {
+  if (!chatHistoryPool) {
+    throw new HttpError(503, 'Cloud chat history is not configured. Set DATABASE_URL on the server.');
+  }
+  chatHistorySchemaReady ??= chatHistoryPool.query(`
+    CREATE TABLE IF NOT EXISTS copilot_chat_sessions (
+      jira_domain TEXT NOT NULL,
+      jira_account_id TEXT NOT NULL,
+      session_id TEXT NOT NULL,
+      session_data JSONB,
+      updated_at TIMESTAMPTZ NOT NULL,
+      deleted_at TIMESTAMPTZ,
+      PRIMARY KEY (jira_domain, jira_account_id, session_id)
+    )
+  `).then(() => undefined).catch((error: unknown) => {
+    chatHistorySchemaReady = null;
+    throw error;
+  });
+  await chatHistorySchemaReady;
+}
+
+async function verifyJiraAccount(req: IncomingMessage): Promise<{ domain: string; accountId: string }> {
+  const authorization = req.headers.authorization || '';
+  const domain = String(req.headers['x-jira-domain'] || '').trim().toLowerCase();
+  if (!/^Basic\s+\S+$/i.test(authorization) || !validJiraDomain(domain)) {
+    throw new HttpError(401, 'Valid Jira Cloud credentials are required.');
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`https://${domain}/rest/api/3/myself`, {
+      headers: { Authorization: authorization, Accept: 'application/json' },
+      redirect: 'error',
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch {
+    throw new HttpError(502, 'Could not verify the Jira account for chat history.');
+  }
+  if (!response.ok) throw new HttpError(401, 'Jira credentials could not be verified.');
+
+  const profile = await response.json() as { accountId?: unknown };
+  if (typeof profile.accountId !== 'string' || !profile.accountId) {
+    throw new HttpError(502, 'Jira did not return an account identity.');
+  }
+  return { domain, accountId: profile.accountId };
+}
+
+function validateChatSessions(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value) || value.length > 200) {
+    throw new HttpError(400, 'Expected at most 200 chat sessions.');
+  }
+  return value.map((session) => {
+    if (!session || typeof session !== 'object' || Array.isArray(session)) {
+      throw new HttpError(400, 'Invalid chat session.');
+    }
+    const candidate = session as Record<string, unknown>;
+    if (typeof candidate.id !== 'string' || candidate.id.length === 0 || candidate.id.length > 160
+      || typeof candidate.title !== 'string' || candidate.title.length > 300
+      || typeof candidate.updated_at !== 'string' || !Number.isFinite(Date.parse(candidate.updated_at))
+      || !Array.isArray(candidate.messages) || candidate.messages.length > 500) {
+      throw new HttpError(400, 'Invalid chat session fields.');
+    }
+    return candidate;
+  });
+}
+
+async function handleChatHistory(req: IncomingMessage, res: ServerResponse, pathname: string): Promise<void> {
+  await ensureChatHistorySchema();
+  const { domain, accountId } = await verifyJiraAccount(req);
+  const pool = chatHistoryPool!;
+
+  if (pathname === '/api/chat-sessions' && req.method === 'GET') {
+    const result = await pool.query(
+      `SELECT session_id, session_data, deleted_at
+       FROM copilot_chat_sessions
+       WHERE jira_domain = $1 AND jira_account_id = $2`,
+      [domain, accountId],
+    );
+    sendJson(res, 200, {
+      sessions: result.rows.filter((row) => row.deleted_at === null).map((row) => row.session_data),
+      deleted: result.rows
+        .filter((row) => row.deleted_at !== null)
+        .map((row) => ({ id: row.session_id, deletedAt: new Date(row.deleted_at).toISOString() })),
+    });
+    return;
+  }
+
+  if (pathname === '/api/chat-sessions' && req.method === 'PUT') {
+    const body = await readJson(req);
+    const sessions = validateChatSessions(body.sessions);
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const session of sessions) {
+        await client.query(
+          `INSERT INTO copilot_chat_sessions
+             (jira_domain, jira_account_id, session_id, session_data, updated_at, deleted_at)
+           VALUES ($1, $2, $3, $4::jsonb, $5::timestamptz, NULL)
+           ON CONFLICT (jira_domain, jira_account_id, session_id) DO UPDATE
+             SET session_data = EXCLUDED.session_data,
+                 updated_at = EXCLUDED.updated_at
+           WHERE copilot_chat_sessions.deleted_at IS NULL
+             AND EXCLUDED.updated_at > copilot_chat_sessions.updated_at`,
+          [domain, accountId, session.id, JSON.stringify(session), session.updated_at],
+        );
+      }
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    sendJson(res, 200, { saved: sessions.length });
+    return;
+  }
+
+  const deleteMatch = pathname.match(/^\/api\/chat-sessions\/([^/]+)$/);
+  if (deleteMatch && req.method === 'DELETE') {
+    let sessionId: string;
+    try {
+      sessionId = decodeURIComponent(deleteMatch[1]);
+    } catch {
+      throw new HttpError(400, 'Invalid chat session ID.');
+    }
+    await pool.query(
+      `INSERT INTO copilot_chat_sessions
+         (jira_domain, jira_account_id, session_id, session_data, updated_at, deleted_at)
+       VALUES ($1, $2, $3, NULL, NOW(), NOW())
+       ON CONFLICT (jira_domain, jira_account_id, session_id) DO UPDATE
+         SET session_data = NULL, updated_at = NOW(), deleted_at = NOW()`,
+      [domain, accountId, sessionId],
+    );
+    sendJson(res, 200, { deleted: true });
+    return;
+  }
+
+  throw new HttpError(405, 'Method not allowed.');
 }
 
 function proxyJira(req: IncomingMessage, res: ServerResponse, target: URL): void {
@@ -118,6 +270,11 @@ function proxyJira(req: IncomingMessage, res: ServerResponse, target: URL): void
 }
 
 async function handleApi(req: IncomingMessage, res: ServerResponse, pathname: string, search: string): Promise<void> {
+  if (pathname === '/api/chat-sessions' || pathname.startsWith('/api/chat-sessions/')) {
+    await handleChatHistory(req, res, pathname);
+    return;
+  }
+
   if (pathname === '/api/copilot-models') {
     if (req.method !== 'GET') throw new HttpError(405, 'Method not allowed.');
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '') || '';

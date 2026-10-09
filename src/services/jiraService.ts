@@ -79,6 +79,14 @@ class JiraService {
     return this.credentials;
   }
 
+  public getChatHistoryAuthHeaders(): Record<string, string> | null {
+    if (!this.isAuthenticated() || !this.credentials?.accountId) return null;
+    return {
+      Authorization: this.getAuthHeader(),
+      'X-Jira-Domain': normalizeDomain(this.credentials.domain),
+    };
+  }
+
   public isAuthenticated(): boolean {
     return Boolean(this.credentials?.domain && this.credentials?.email && this.credentials?.apiToken);
   }
