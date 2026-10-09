@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Project, Epic, Issue, ContextVersion, TicketDraft, AuthStatus, BuildContextOptions } from './types';
 import { api } from './services/api';
 import { jiraService, JiraUserProfile } from './services/jiraService';
+import { getUserStorageScope, purgeLegacyUserStorage } from './services/userStorage';
 import { contextService } from './services/contextService';
 import { copilotService } from './services/copilotService';
 import { Header } from './components/Header';
@@ -57,6 +58,7 @@ export function App() {
   // Initialize and check for stored session
   useEffect(() => {
     async function initAuth() {
+      purgeLegacyUserStorage();
       const storedCreds = jiraService.loadStoredCredentials();
       if (storedCreds) {
         try {
@@ -68,7 +70,8 @@ export function App() {
             jira_account_name: profile.displayName,
             jira_account_email: profile.emailAddress,
           }));
-          await syncLiveJiraData();
+          jiraService.saveCredentials(storedCreds, profile.accountId);
+          await syncLiveJiraData(undefined, true);
         } catch (e) {
           console.warn('Stored Jira credentials failed verification, resetting to logged-out state:', e);
           jiraService.clearCredentials();
@@ -77,12 +80,12 @@ export function App() {
         }
       }
 
-      // Load persistent drafts from storage
-      const storedDrafts = await api.getTicketDrafts();
-      setDrafts(storedDrafts);
+      if (getUserStorageScope()) {
+        setDrafts(await api.getTicketDrafts());
+      }
 
-      // Check for stored GitHub Copilot token
-      const ghToken = copilotService.getGithubToken();
+      // Copilot credentials are read only after Jira activates this account's storage scope.
+      const ghToken = getUserStorageScope() ? copilotService.getGithubToken() : '';
       if (ghToken) {
         try {
           await copilotService.validateGithubToken(ghToken);
@@ -110,7 +113,7 @@ export function App() {
   /**
    * Fetches real projects, epics, and all issues from Jira Cloud
    */
-  const syncLiveJiraData = async (targetProject?: Project) => {
+  const syncLiveJiraData = async (targetProject?: Project, preferFirstProject = false) => {
     if (!jiraService.isAuthenticated()) return;
     setIsSyncing(true);
     try {
@@ -118,7 +121,7 @@ export function App() {
       setProjects(projs);
 
       if (projs.length > 0) {
-        const activeProj = targetProject || currentProject || projs[0];
+        const activeProj = targetProject || (preferFirstProject ? projs[0] : currentProject || projs[0]);
         setCurrentProject(activeProj);
 
         // Fetch all Epics in project (supports both Team-managed and Company-managed)
@@ -243,23 +246,14 @@ export function App() {
   };
 
   const handleConnectJiraSuccess = async (profile: JiraUserProfile) => {
-    setAuthStatus((prev) => ({
-      ...prev,
+    setAuthStatus({
       jira_connected: true,
       jira_account_name: profile.displayName,
       jira_account_email: profile.emailAddress,
-    }));
-    await syncLiveJiraData();
-  };
-
-  const handleDisconnectJira = async () => {
-    jiraService.clearCredentials();
-    setAuthStatus((prev) => ({
-      ...prev,
-      jira_connected: false,
-      jira_account_name: undefined,
-      jira_account_email: undefined,
-    }));
+      copilot_connected: false,
+      copilot_account_name: undefined,
+      copilot_token: undefined,
+    });
     setProjects([]);
     setCurrentProject(null);
     setEpics([]);
@@ -267,9 +261,60 @@ export function App() {
     setIssues([]);
     setAllProjectIssues([]);
     setContextVersion(null);
+    setDrafts([]);
+    setReviewDraft(null);
+    setIsReviewModalOpen(false);
+    setIsBuildContextOpen(false);
+    setCurrentView('explorer');
+    setIsCopilotOpen(false);
+    setDrafts(await api.getTicketDrafts());
+    const storedCopilotToken = copilotService.getGithubToken();
+    if (storedCopilotToken) {
+      try {
+        await copilotService.validateGithubToken(storedCopilotToken);
+        setAuthStatus((prev) => ({
+          ...prev,
+          copilot_connected: true,
+          copilot_account_name: 'GitHub Copilot',
+          copilot_token: storedCopilotToken,
+        }));
+      } catch {
+        // Keep this Jira account disconnected from the invalid stored Copilot token.
+      }
+    }
+    await syncLiveJiraData(undefined, true);
+  };
+
+  const handleDisconnectJira = async () => {
+    setAuthStatus((prev) => ({
+      ...prev,
+      jira_connected: false,
+      jira_account_name: undefined,
+      jira_account_email: undefined,
+      copilot_connected: false,
+      copilot_account_name: undefined,
+      copilot_token: undefined,
+    }));
+    jiraService.clearCredentials();
+    setProjects([]);
+    setCurrentProject(null);
+    setEpics([]);
+    setSelectedEpic(null);
+    setIssues([]);
+    setAllProjectIssues([]);
+    setContextVersion(null);
+    setDrafts([]);
+    setReviewDraft(null);
+    setIsReviewModalOpen(false);
+    setIsBuildContextOpen(false);
+    setCurrentView('explorer');
+    setIsCopilotOpen(false);
   };
 
   const handleConnectCopilot = async (token: string) => {
+    if (!getUserStorageScope()) {
+      throw new Error('Connect a Jira account before saving Copilot credentials.');
+    }
     await copilotService.validateGithubToken(token);
     copilotService.setGithubToken(token);
     setAuthStatus((prev) => ({
@@ -552,7 +597,7 @@ export function App() {
           onOpenConnectModal={() => setIsAuthModalOpen(true)}
         />
       ) : (
-        <div className="workspace-layout">
+        <div key={getUserStorageScope() || 'anonymous'} className="workspace-layout">
           <Sidebar
             epics={epics}
             selectedEpic={selectedEpic}
@@ -606,6 +651,7 @@ export function App() {
 
       {/* Copilot Delivery Analyst Agent Drawer */}
       <CopilotAgentDrawer
+        key={getUserStorageScope() || 'anonymous'}
         isOpen={isCopilotOpen}
         onClose={() => setIsCopilotOpen(false)}
         currentProject={currentProject}
@@ -635,6 +681,7 @@ export function App() {
 
       {/* Mandatory Ticket Review & Creation Modal */}
       <TicketReviewModal
+        key={getUserStorageScope() || 'anonymous'}
         isOpen={isReviewModalOpen}
         onClose={() => setIsReviewModalOpen(false)}
         currentProject={currentProject}
@@ -647,6 +694,7 @@ export function App() {
 
       {/* Build Context Modal */}
       <BuildContextModal
+        key={getUserStorageScope() || 'anonymous'}
         currentProject={currentProject}
         epics={epics}
         selectedEpic={selectedEpic}
@@ -659,6 +707,7 @@ export function App() {
 
       {/* Jira Cloud Auth Modal */}
       <AuthModal
+        key={getUserStorageScope() || 'anonymous'}
         authStatus={authStatus}
         isOpen={isAuthModalOpen}
         onClose={() => setIsAuthModalOpen(false)}

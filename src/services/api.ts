@@ -1,5 +1,6 @@
 import { Project, Epic, Issue, ContextVersion, TicketDraft, AuthStatus, BuildContextOptions } from '../types';
 import { jiraService } from './jiraService';
+import { getUserStorageItem, setUserStorageItem } from './userStorage';
 
 let tauriInvoke: (<T>(cmd: string, args?: Record<string, unknown>) => Promise<T>) | null = null;
 
@@ -23,7 +24,7 @@ const DRAFTS_STORAGE_KEY = 'project_intelligence_ticket_drafts_v1';
 
 function getStoredDrafts(): TicketDraft[] {
   try {
-    const raw = localStorage.getItem(DRAFTS_STORAGE_KEY);
+    const raw = getUserStorageItem(DRAFTS_STORAGE_KEY);
     return raw ? JSON.parse(raw) : [];
   } catch {
     return [];
@@ -32,7 +33,7 @@ function getStoredDrafts(): TicketDraft[] {
 
 function saveStoredDrafts(drafts: TicketDraft[]): void {
   try {
-    localStorage.setItem(DRAFTS_STORAGE_KEY, JSON.stringify(drafts));
+    setUserStorageItem(DRAFTS_STORAGE_KEY, JSON.stringify(drafts));
   } catch (e) {
     console.warn('Failed to persist drafts to localStorage:', e);
   }

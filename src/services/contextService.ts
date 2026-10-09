@@ -1,4 +1,5 @@
 import { Epic, Issue, ContextVersion, BuildContextOptions, ContextSubsystem, ContextWorkflow, ContextTicketReference } from '../types';
+import { getUserStorageItem, setUserStorageItem } from './userStorage';
 
 const STORAGE_KEY = 'project_intelligence_context_history_v1';
 
@@ -8,7 +9,7 @@ export class ContextService {
    */
   public getEpicHistory(epicId: string): ContextVersion[] {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = getUserStorageItem(STORAGE_KEY);
       if (!raw) return [];
       const store: Record<string, ContextVersion[]> = JSON.parse(raw);
       const list = store[epicId] || [];
@@ -26,7 +27,7 @@ export class ContextService {
 
       if (modified) {
         store[epicId] = enrichedList;
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+        setUserStorageItem(STORAGE_KEY, JSON.stringify(store));
       }
 
       return enrichedList;
@@ -49,7 +50,7 @@ export class ContextService {
    */
   public saveContextVersion(cv: ContextVersion): void {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = getUserStorageItem(STORAGE_KEY);
       const store: Record<string, ContextVersion[]> = raw ? JSON.parse(raw) : {};
       const currentList = store[cv.epic_id] || [];
 
@@ -57,7 +58,7 @@ export class ContextService {
       const updatedList = [cv, ...currentList.filter((item) => item.id !== cv.id)];
       store[cv.epic_id] = updatedList;
 
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+      setUserStorageItem(STORAGE_KEY, JSON.stringify(store));
     } catch (e) {
       console.warn('Failed to save context version:', e);
     }
@@ -144,12 +145,12 @@ export class ContextService {
    */
   public deleteContextVersion(epicId: string, versionId: string): void {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY);
+      const raw = getUserStorageItem(STORAGE_KEY);
       if (!raw) return;
       const store: Record<string, ContextVersion[]> = JSON.parse(raw);
       if (store[epicId]) {
         store[epicId] = store[epicId].filter((v) => v.id !== versionId);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+        setUserStorageItem(STORAGE_KEY, JSON.stringify(store));
       }
     } catch (e) {
       console.warn('Failed to delete context version:', e);

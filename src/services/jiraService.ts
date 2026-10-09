@@ -1,9 +1,11 @@
 import { Project, Epic, Issue } from '../types';
+import { activateUserStorageScope, clearUserStorageScope } from './userStorage';
 
 export interface JiraCredentials {
   domain: string; // e.g. "mycompany.atlassian.net"
   email: string;
   apiToken: string;
+  accountId?: string;
 }
 
 export interface JiraUserProfile {
@@ -27,7 +29,8 @@ export function normalizeDomain(raw: string): string {
 
 class JiraService {
   private credentials: JiraCredentials | null = null;
-  private readonly STORAGE_KEY = 'jira_cloud_credentials';
+  private readonly SESSION_STORAGE_KEY = 'jira_cloud_credentials_v2';
+  private readonly LEGACY_STORAGE_KEY = 'jira_cloud_credentials';
 
   constructor() {
     this.loadStoredCredentials();
@@ -35,7 +38,7 @@ class JiraService {
 
   public loadStoredCredentials(): JiraCredentials | null {
     try {
-      const stored = localStorage.getItem(this.STORAGE_KEY);
+      const stored = sessionStorage.getItem(this.SESSION_STORAGE_KEY);
       if (stored) {
         this.credentials = JSON.parse(stored);
         if (this.credentials?.domain) {
@@ -43,25 +46,33 @@ class JiraService {
         }
         return this.credentials;
       }
+      localStorage.removeItem(this.LEGACY_STORAGE_KEY);
     } catch (e) {
-      console.warn('Failed to parse stored Jira credentials:', e);
+      console.warn('Failed to load Jira credentials for this browser session:', e);
     }
+    this.credentials = null;
+    clearUserStorageScope();
     return null;
   }
 
-  public saveCredentials(creds: JiraCredentials) {
+  public saveCredentials(creds: JiraCredentials, accountId: string) {
     const cleanDomain = normalizeDomain(creds.domain);
     this.credentials = {
       domain: cleanDomain,
       email: creds.email.trim(),
       apiToken: creds.apiToken.trim(),
+      accountId,
     };
-    localStorage.setItem(this.STORAGE_KEY, JSON.stringify(this.credentials));
+    activateUserStorageScope(accountId, cleanDomain);
+    sessionStorage.setItem(this.SESSION_STORAGE_KEY, JSON.stringify(this.credentials));
+    localStorage.removeItem(this.LEGACY_STORAGE_KEY);
   }
 
   public clearCredentials() {
     this.credentials = null;
-    localStorage.removeItem(this.STORAGE_KEY);
+    sessionStorage.removeItem(this.SESSION_STORAGE_KEY);
+    localStorage.removeItem(this.LEGACY_STORAGE_KEY);
+    clearUserStorageScope();
   }
 
   public getCredentials(): JiraCredentials | null {

@@ -70,7 +70,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       };
 
       const profile = await jiraService.testConnection(creds);
-      jiraService.saveCredentials(creds);
+      jiraService.saveCredentials(creds, profile.accountId);
       setJiraSuccess(`Authenticated as ${profile.displayName} (${profile.emailAddress})`);
       await onConnectJiraSuccess(profile, creds);
     } catch (err: unknown) {
@@ -205,7 +205,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
                   </label>
                   <input
                     type="text"
-                    placeholder="e.g. aethereus.atlassian.net"
+                    placeholder="e.g. <your-company>.atlassian.net"
                     value={domain}
                     onChange={(e) => setDomain(e.target.value)}
                     onBlur={() => domain.trim() && setDomain(normalizeDomain(domain))}

@@ -11,6 +11,7 @@ import {
   RequirementAnalysisResult,
   TicketDraft,
 } from '../types';
+import { getUserStorageItem, removeUserStorageItem, setUserStorageItem } from './userStorage';
 
 export interface CopilotEpicContextAnalysis {
   summary: string;
@@ -64,38 +65,16 @@ const STORAGE_KEYS = {
 };
 
 class CopilotService {
-  private githubToken: string = '';
-  private customEndpoint: string = '';
-  constructor() {
-    this.loadCredentials();
-  }
-
-  private loadCredentials() {
-    if (typeof window !== 'undefined') {
-      this.githubToken = localStorage.getItem(STORAGE_KEYS.GITHUB_TOKEN) || '';
-      this.customEndpoint = localStorage.getItem(STORAGE_KEYS.COPILOT_ENDPOINT) || '';
-    }
-  }
-
   public getGithubToken(): string {
-    if (!this.githubToken && typeof window !== 'undefined') {
-      this.githubToken = localStorage.getItem(STORAGE_KEYS.GITHUB_TOKEN) || '';
-    }
-    return this.githubToken;
+    return getUserStorageItem(STORAGE_KEYS.GITHUB_TOKEN) || '';
   }
 
   public setGithubToken(token: string) {
-    this.githubToken = token.trim();
-    if (typeof window !== 'undefined') {
-      localStorage.setItem(STORAGE_KEYS.GITHUB_TOKEN, this.githubToken);
-    }
+    setUserStorageItem(STORAGE_KEYS.GITHUB_TOKEN, token.trim());
   }
 
   public clearGithubToken() {
-    this.githubToken = '';
-    if (typeof window !== 'undefined') {
-      localStorage.removeItem(STORAGE_KEYS.GITHUB_TOKEN);
-    }
+    removeUserStorageItem(STORAGE_KEYS.GITHUB_TOKEN);
   }
 
   public isConnected(): boolean {
@@ -103,22 +82,19 @@ class CopilotService {
   }
 
   public getCustomEndpoint(): string {
-    return this.customEndpoint;
+    return getUserStorageItem(STORAGE_KEYS.COPILOT_ENDPOINT) || '';
   }
 
   public setCustomEndpoint(endpoint: string) {
-    this.customEndpoint = endpoint.trim();
-    if (typeof window !== 'undefined') {
-      localStorage.setItem(STORAGE_KEYS.COPILOT_ENDPOINT, this.customEndpoint);
-    }
+    setUserStorageItem(STORAGE_KEYS.COPILOT_ENDPOINT, endpoint.trim());
   }
 
   // --- Session Management ---
 
   public getSessions(): CopilotChatSession[] {
-    if (typeof window === 'undefined') return [];
+    if (typeof window === 'undefined' || !this.getGithubToken() && !getUserStorageItem(STORAGE_KEYS.SESSIONS)) return [];
     try {
-      const data = localStorage.getItem(STORAGE_KEYS.SESSIONS);
+      const data = getUserStorageItem(STORAGE_KEYS.SESSIONS);
       if (data) {
         return JSON.parse(data) as CopilotChatSession[];
       }
@@ -131,7 +107,7 @@ class CopilotService {
   public saveSessions(sessions: CopilotChatSession[]): void {
     if (typeof window === 'undefined') return;
     try {
-      localStorage.setItem(STORAGE_KEYS.SESSIONS, JSON.stringify(sessions));
+      setUserStorageItem(STORAGE_KEYS.SESSIONS, JSON.stringify(sessions));
     } catch (e) {
       console.error('Failed to save copilot sessions:', e);
     }
@@ -139,12 +115,12 @@ class CopilotService {
 
   public getActiveSessionId(): string | null {
     if (typeof window === 'undefined') return null;
-    return localStorage.getItem(STORAGE_KEYS.ACTIVE_SESSION_ID);
+    return getUserStorageItem(STORAGE_KEYS.ACTIVE_SESSION_ID);
   }
 
   public setActiveSessionId(id: string): void {
     if (typeof window === 'undefined') return;
-    localStorage.setItem(STORAGE_KEYS.ACTIVE_SESSION_ID, id);
+    setUserStorageItem(STORAGE_KEYS.ACTIVE_SESSION_ID, id);
   }
 
   public getOrCreateActiveSession(projectKey: string = 'ISB'): CopilotChatSession {
@@ -217,7 +193,7 @@ class CopilotService {
       if (filtered.length > 0) {
         this.setActiveSessionId(filtered[0].id);
       } else {
-        localStorage.removeItem(STORAGE_KEYS.ACTIVE_SESSION_ID);
+        removeUserStorageItem(STORAGE_KEYS.ACTIVE_SESSION_ID);
       }
     }
     return filtered;
